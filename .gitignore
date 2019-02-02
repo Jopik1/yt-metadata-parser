@@ -1,4 +1,6 @@
 yt-metadata-parser
+blockids.txt
+videos.json.gz
 
 # Binaries for programs and plugins
 *.exe
