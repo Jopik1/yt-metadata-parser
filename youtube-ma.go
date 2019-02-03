@@ -1686,7 +1686,7 @@ func JSONMarshalIndentNoEscapeHTML(i interface{}, prefix string, indent string) 
 
 func main() {
 
-	runtime.GOMAXPROCS(32)
+	runtime.GOMAXPROCS(256)
 	rand.Seed(time.Now().Unix())
 
 	argumentParsing(os.Args[1:])
