@@ -1538,7 +1538,7 @@ func populateFlags(args []string) {
 	flag.Parse()
 }
 
-var controlClient = &http.Client{Timeout: 10 * time.Second}
+var controlClient = &http.Client{Timeout: 260 * time.Second}
 
 func getJSON(url string, target interface{}) error {
 	r, err := controlClient.Get(url)
