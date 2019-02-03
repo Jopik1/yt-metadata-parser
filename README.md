@@ -16,5 +16,8 @@ run with:
 
 ```
 $ go build
-$ ./yt-metadata-parser -Concurrency=8 -MasterServer=http://ytc.bot.nu
+$ ./yt-metadata-parser -Concurrency=16 -MasterServer=http://ytc.bot.nu
 ```
+
+
+Concurrency specifies how many concurent connections will be made to youtube.
