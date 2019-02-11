@@ -26,6 +26,7 @@ import (
 	"io/ioutil"
 	"log"
 	"math/rand"
+
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -45,6 +46,7 @@ import (
 	"golang.org/x/net/html"
 	"golang.org/x/net/proxy"
 )
+import crytporand "crypto/rand"
 
 /*var roundTripper = &http.Transport{
 	Dial: (&net.Dialer{
@@ -59,7 +61,7 @@ import (
 
 var logger = log.New(os.Stdout, "", 0)
 
-var formatVersion = 3
+var formatVersion = 4
 var isDebug = false
 var outTransports = []*http.Transport{}
 
@@ -75,6 +77,7 @@ var cmdFlags = struct {
 	SubPathLen           int
 	MasterServer         string
 	Concurrency          int64
+	WorkerUUID           string
 }{
 	true,  //DeepDirFormat
 	false, //GetAutoSub
@@ -87,6 +90,7 @@ var cmdFlags = struct {
 	2,
 	"",
 	8,
+	"",
 }
 
 var combinedOutFile = struct {
@@ -100,19 +104,20 @@ var combinedOutFile = struct {
 
 // Video structure containing all metadata for the video
 type Video struct {
-	ID               string
-	Title            string
-	Annotations      string
-	Thumbnail        string
-	Description      string
-	Path             string
-	RawHTML          string
-	InfoJSON         infoJSON
-	playerArgs       map[string]interface{}
-	playerResponse   map[string]interface{}
-	InteractionCount int64
-	RawFormats       []url.Values
-	HTTPTransport    *http.Transport
+	ID                string
+	Title             string
+	Annotations       string
+	Thumbnail         string
+	Description       string
+	Path              string
+	RawHTML           string
+	InfoJSON          infoJSON
+	playerArgs        map[string]interface{}
+	playerResponse    map[string]interface{}
+	InteractionCount  int64
+	GotPlayerResponse bool
+	RawFormats        []url.Values
+	HTTPTransport     *http.Transport
 }
 
 // Tracklist structure containing all subtitles tracks for the video
@@ -243,7 +248,21 @@ type workBatch struct {
 	Message   string   `json:"message,omitempty"`
 }
 
-func sendMultipart(url string, params map[string]string, field string, name string) (*http.Response, error) {
+// newUUID generates a random UUID according to RFC 4122
+func newUUID() (string, error) {
+	uuid := make([]byte, 16)
+	n, err := io.ReadFull(crytporand.Reader, uuid)
+	if n != len(uuid) || err != nil {
+		return "", err
+	}
+	// variant bits; see section 4.1.1
+	uuid[8] = uuid[8]&^0xc0 | 0x80
+	// version 4 (pseudo-random); see section 4.1.3
+	uuid[6] = uuid[6]&^0xf0 | 0x40
+	return fmt.Sprintf("%x-%x-%x-%x-%x", uuid[0:4], uuid[4:6], uuid[6:8], uuid[8:10], uuid[10:]), nil
+}
+
+func sendMultipart(url string, params map[string]string, field string, data *bytes.Buffer) (*http.Response, error) {
 	r, w := io.Pipe()
 	mWriter := multipart.NewWriter(w)
 
@@ -255,20 +274,21 @@ func sendMultipart(url string, params map[string]string, field string, name stri
 			_ = mWriter.WriteField(key, val)
 		}
 
-		fWriter, err := mWriter.CreateFormFile(field, name)
+		fWriter, err := mWriter.CreateFormFile(field, "data")
+
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "CreateFormFile failed: %v\n", err)
 			return
 		}
 
-		file, err := os.Open(name)
+		/*file, err := os.Open(name)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Open file %s failed: %v\n", name, err)
 			return
 		}
-		defer file.Close()
-
-		if _, err = io.Copy(fWriter, file); err != nil {
+		defer file.Close()*/
+		bufferReader := bufio.NewReader(data)
+		if _, err = io.Copy(fWriter, bufferReader); err != nil {
 			fmt.Fprintf(os.Stderr, "io.Copy failed: %v\n", err)
 			return
 		}
@@ -527,6 +547,7 @@ func parsePlayerArgs(video *Video, document *goquery.Document) {
 
 	// extract ytplayer.config
 	script := document.Find("div#player").Find("script")
+	video.GotPlayerResponse = false
 	script.Each(func(i int, s *goquery.Selection) {
 		js := s.Text()
 		if strings.HasPrefix(js, pre) {
@@ -538,6 +559,7 @@ func parsePlayerArgs(video *Video, document *goquery.Document) {
 			var cfg struct {
 				Args map[string]interface{}
 			}
+			//fmt.Println(strCfg)
 			err := json.Unmarshal([]byte(strCfg), &cfg)
 			if err != nil {
 				fmt.Println(err)
@@ -557,10 +579,12 @@ func parsePlayerArgs(video *Video, document *goquery.Document) {
 				tmpData := []byte((video.playerArgs["player_response"]).(string))
 				ioutil.WriteFile(baseFileName+".player_response.json", tmpData, 0644)
 			}
+
 			if video.playerArgs["player_response"] == nil {
 				fmt.Fprintf(os.Stderr, "Error: %s\n", "player_response not present in file")
 				runtime.Goexit()
 			}
+			video.GotPlayerResponse = true
 			err = json.Unmarshal([]byte((video.playerArgs["player_response"]).(string)), &video.playerResponse)
 			if err != nil {
 				//panic(err)
@@ -570,6 +594,37 @@ func parsePlayerArgs(video *Video, document *goquery.Document) {
 
 		}
 	})
+
+	if !video.GotPlayerResponse {
+		//fmt.Println("no player response, could be age restricted")
+		userAgent := "" //"Go-http-client/1.1"
+		html, err := HTTPRequestCustomUserAgent("https://www.youtube.com/get_video_info?video_id="+video.ID+"&ps=default&eurl=&gl=US&hl=en&disable_polymer=1", userAgent, video.HTTPTransport)
+		body, err := ioutil.ReadAll(html.Body)
+		valueMap, err := url.ParseQuery(string(body))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: Unable to fetch get_video_info page %s %v\n", video.ID, err)
+			return
+		}
+
+		if len(valueMap["player_response"]) > 0 {
+			video.playerArgs["player_response"] = valueMap["player_response"][0]
+			err = json.Unmarshal([]byte((video.playerArgs["player_response"]).(string)), &video.playerResponse)
+			if err != nil {
+				//panic(err)
+				fmt.Fprintf(os.Stderr, "Error extracting player_response: %s %v\n", video.ID, err)
+				return
+			}
+		}
+		if len(valueMap["url_encoded_fmt_stream_map"]) > 0 {
+			video.playerArgs["url_encoded_fmt_stream_map"] = valueMap["url_encoded_fmt_stream_map"][0]
+		}
+		if len(valueMap["adaptive_fmts"]) > 0 {
+			video.playerArgs["adaptive_fmts"] = valueMap["adaptive_fmts"][0]
+		}
+		if len(valueMap["length_seconds"]) > 0 {
+			video.playerArgs["length_seconds"] = valueMap["length_seconds"][0]
+		}
+	}
 }
 
 func parseIsCommentsEnabled(video *Video, document *goquery.Document) {
@@ -683,12 +738,10 @@ func parseLikeDislike(video *Video, document *goquery.Document) {
 }
 
 func parseDatePublished(video *Video, document *goquery.Document) {
-	document.Find("meta").Each(func(i int, s *goquery.Selection) {
-		if name, _ := s.Attr("itemprop"); name == "datePublished" {
-			date, _ := s.Attr("content")
-			date = strings.Replace(date, "-", "", -1)
-			video.InfoJSON.UploadDate = date
-		}
+	document.Find("meta[itemprop='datePublished']").Each(func(i int, s *goquery.Selection) {
+		date, _ := s.Attr("content")
+		date = strings.Replace(date, "-", "", -1)
+		video.InfoJSON.UploadDate = date
 	})
 }
 
@@ -784,18 +837,25 @@ func addFormats(video *Video) {
 }
 
 func parseFormats(video *Video) {
+	codecCount := 0
 	if l, ok := video.playerArgs["adaptive_fmts"]; ok {
 		formats := strings.Split(l.(string), ",")
 		for _, format := range formats {
-			args, _ := url.ParseQuery(format)
-			video.RawFormats = append(video.RawFormats, args)
+			if len(format) > 3 {
+				args, _ := url.ParseQuery(format)
+				video.RawFormats = append(video.RawFormats, args)
+				codecCount++
+			}
 		}
 	} else {
 		if l, ok := video.playerArgs["url_encoded_fmt_stream_map"]; ok {
 			formats := strings.Split(l.(string), ",")
 			for _, format := range formats {
-				args, _ := url.ParseQuery(format)
-				video.RawFormats = append(video.RawFormats, args)
+				if len(format) > 3 {
+					args, _ := url.ParseQuery(format)
+					video.RawFormats = append(video.RawFormats, args)
+					codecCount++
+				}
 			}
 		}
 	}
@@ -805,11 +865,9 @@ func parseFormats(video *Video) {
 }
 
 func parseTags(video *Video, document *goquery.Document) {
-	document.Find("meta").Each(func(i int, s *goquery.Selection) {
-		if name, _ := s.Attr("property"); name == "og:video:tag" {
-			tag, _ := s.Attr("content")
-			video.InfoJSON.Tags = append(video.InfoJSON.Tags, tag)
-		}
+	document.Find("meta[property='og:video:tag']").Each(func(i int, s *goquery.Selection) {
+		tag, _ := s.Attr("content")
+		video.InfoJSON.Tags = append(video.InfoJSON.Tags, tag)
 	})
 }
 
@@ -935,8 +993,19 @@ func parseCategory(video *Video, document *goquery.Document) {
 	}
 }
 
-func parseAgeLimit(video *Video) {
-	m := regexpGetAgeLimit.FindAllStringSubmatch(video.RawHTML, -1)
+func parseAgeLimit(video *Video, document *goquery.Document) {
+	watch7Headline := document.Find("meta[property='og:restrictions:age']")
+	age, ok := watch7Headline.Attr("content")
+	video.InfoJSON.AgeLimit = 0
+	if ok {
+		if len(age) > 1 {
+			video.InfoJSON.AgeLimit = cast.ToFloat64(regLeaveOnlyDigits.ReplaceAllString(age, ""))
+			if video.InfoJSON.AgeLimit == 0 {
+				video.InfoJSON.AgeLimit = 18
+			}
+		}
+	}
+	/*m := regexpGetAgeLimit.FindAllStringSubmatch(video.RawHTML, -1)
 	if len(m) == 1 && len(m[0]) == 2 {
 		doc, err := goquery.NewDocumentFromReader(strings.NewReader(m[0][1]))
 		if err != nil {
@@ -946,8 +1015,9 @@ func parseAgeLimit(video *Video) {
 		if strings.Contains(isLicense, "Age-restricted video (based on Community Guidelines)") == true {
 			video.InfoJSON.AgeLimit = 18
 		}
-	}
+	}*/
 }
+
 func parseDuration(video *Video) {
 	if l, ok := video.playerArgs["length_seconds"]; ok {
 		dur, _ := strconv.ParseInt(l.(string), 10, 64)
@@ -960,7 +1030,7 @@ func parseUnavailable(video *Video, document *goquery.Document) {
 	          &quot;www.MMO-CheatShop.com ...&quot; is no longer available due to a copyright claim by Jagex Ltd..
 
 	</h1>*/
-	if video.playerArgs == nil || len(video.playerArgs) == 0 {
+	if !video.GotPlayerResponse {
 		unavailableMessage := document.Find("#unavailable-message")
 
 		if unavailableMessage.Length() > 0 {
@@ -1041,18 +1111,16 @@ func parseVariousInfo(video *Video, document *goquery.Document) {
 	parseTags(video, document)
 	parseCategory(video, document)
 	parseViewCount(video, document)
-	parseAgeLimit(video)
+	parseAgeLimit(video, document)
 	parseDuration(video)
 	parseUnavailable(video, document)
 }
 
 func parseThumbnailURL(video *Video, document *goquery.Document) {
 	// extract thumbnail url
-	document.Find("meta").Each(func(i int, s *goquery.Selection) {
-		if name, _ := s.Attr("property"); name == "og:image" {
-			thumbnailURL, _ := s.Attr("content")
-			video.Thumbnail = strings.Replace(thumbnailURL, "https", "http", -1)
-		}
+	document.Find("meta[property='og:image']").Each(func(i int, s *goquery.Selection) {
+		thumbnailURL, _ := s.Attr("content")
+		video.Thumbnail = strings.Replace(thumbnailURL, "https", "http", -1)
 	})
 }
 
@@ -1088,8 +1156,8 @@ func parseHTML(video *Video) {
 	// request video html page
 	// use desktop user agent
 	//userAgent := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Safari/537.36"
-	userAgent := ""
-	html, err := HTTPRequestCustomUserAgent("https://www.youtube.com/watch?v="+video.ID+"&gl=US&hl=en&has_verified=1&bpctr=9999999999", userAgent, video.HTTPTransport)
+	userAgent := "" //"Go-http-client/1.1"
+	html, err := HTTPRequestCustomUserAgent("https://www.youtube.com/watch?v="+video.ID+"&gl=US&hl=en&disable_polymer=1&has_verified=1&bpctr=9999999999", userAgent, video.HTTPTransport)
 
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -1108,6 +1176,10 @@ func parseHTML(video *Video) {
 	baseFileName := video.Path + video.ID
 	if !cmdFlags.DeepDirFormat {
 		baseFileName += "_" + video.Title
+	}
+
+	if isDebug {
+		ioutil.WriteFile(baseFileName+".rawHTML.html", body, 0644)
 	}
 
 	//ioutil.WriteFile(baseFileName+".rawHTML.html", body, 0644)
@@ -1438,32 +1510,38 @@ func logInfo(info string, video *Video, log string) {
 	}
 }
 
-func processList(maxConc int64, path string, tempFile string) {
+func processList(maxConc int64, path string, listOfIDsBuffer *string, gzipOutput *bytes.Buffer) {
 	var count int64
 	count = 0
 
-	// open file
-	file, err := os.Open(path)
-	if err != nil {
-		log.Fatal(err)
+	isRemoteRun := len(cmdFlags.MasterServer) > 0
+	var file *os.File
+	var err error
+	var scanner *bufio.Scanner
+	if !isRemoteRun {
+		file, err = os.Open(path)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer file.Close()
+		scanner = bufio.NewScanner(file)
+	} else {
+		scanner = bufio.NewScanner(strings.NewReader(*listOfIDsBuffer))
 	}
-	defer file.Close()
+
 	// scan the list line by line
-	scanner := bufio.NewScanner(file)
-	// scan the list line by line
-	var videosFile *os.File
+	//var videosFile *os.File
 	var videosFileGz *gzip.Writer
 	var fileCreateError error
 
-	if len(cmdFlags.MasterServer) > 0 {
-		videosFile, fileCreateError = os.Create(tempFile)
+	if isRemoteRun {
+		/*videosFile, fileCreateError = os.Create(tempFile)
 		if fileCreateError != nil {
 			fmt.Fprintf(os.Stderr, "Error creating videos.json.gz: %v\n", fileCreateError)
 			runtime.Goexit()
 		}
-		defer videosFile.Close()
-
-		videosFileGz, fileCreateError = gzip.NewWriterLevel(videosFile, gzip.BestCompression)
+		defer videosFile.Close()*/
+		videosFileGz, fileCreateError = gzip.NewWriterLevel(gzipOutput, gzip.BestCompression)
 		if fileCreateError != nil {
 			fmt.Fprintf(os.Stderr, "Error creating gzip writer videos.json.gz: %v\n", fileCreateError)
 			runtime.Goexit()
@@ -1502,7 +1580,7 @@ func processList(maxConc int64, path string, tempFile string) {
 		}
 	}
 
-	if len(cmdFlags.MasterServer) > 0 {
+	if isRemoteRun {
 		combinedOutFile.mutex.Lock()
 		defer combinedOutFile.mutex.Unlock()
 		combinedOutFile.outFile.Write([]byte("]"))
@@ -1535,10 +1613,11 @@ func populateFlags(args []string) {
 	flag.IntVar(&cmdFlags.SubPathLen, "SubPathLen", cmdFlags.SubPathLen, "an int")
 	flag.Int64Var(&cmdFlags.Concurrency, "Concurrency", cmdFlags.Concurrency, "an int")
 
+	cmdFlags.WorkerUUID, _ = newUUID()
 	flag.Parse()
 }
 
-var controlClient = &http.Client{Timeout: 260 * time.Second}
+var controlClient = &http.Client{Timeout: 300 * time.Second}
 
 func getJSON(url string, target interface{}) error {
 	r, err := controlClient.Get(url)
@@ -1578,19 +1657,23 @@ func argumentParsing(args []string) {
 	}
 	batchID := ""
 	batchUUID := ""
-	tempFile := "videos.json.gz"
 
 	continueRunning := true
+	var gzipBuffer bytes.Buffer
 	for continueRunning {
 		start := time.Now()
 		if isRemoteRun {
 			//fetch block from server
-			fileWithIds = "blockids.txt"
 			newWorkBatch := new(workBatch) // or &Foo{}
-
-			err := getJSON(cmdFlags.MasterServer+"/getBatchWorkUnit", newWorkBatch)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Unable to fetch getBatchWorkUnit: %v\n", err)
+			batchUnitURL := cmdFlags.MasterServer + "/getBatchWorkUnit?version=" + strconv.FormatInt(int64(formatVersion), 10) + "&workerUUID=" + url.QueryEscape(cmdFlags.WorkerUUID)
+			//fmt.Println(batchUnitURL)
+			err := getJSON(batchUnitURL, newWorkBatch)
+			if err != nil || (len(newWorkBatch.VideoIDS) == 0) {
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Unable to fetch getBatchWorkUnit: %v\n", err)
+				} else {
+					fmt.Fprintf(os.Stderr, "Recieved empty work unit, maybe all batches were downloaded\n")
+				}
 				sleepTime := 20
 				fmt.Printf("Sleeping %d seconds and then will retry\n", sleepTime)
 				time.Sleep(time.Duration(sleepTime) * time.Second)
@@ -1598,49 +1681,49 @@ func argumentParsing(args []string) {
 			}
 			batchID = newWorkBatch.BatchID
 			batchUUID = newWorkBatch.BatchUUID
+
 			fmt.Println(fmt.Sprintf("Recieved batch unit for download BatchID:%s (%s) - %d videos", batchID, batchUUID, len(newWorkBatch.VideoIDS)))
 
-			tempIDsFile, err := os.Create(fileWithIds)
-			defer tempIDsFile.Close()
-			if err != nil {
-				log.Fatal(err)
-			}
+			var temp bytes.Buffer
 
 			for idx, element := range newWorkBatch.VideoIDS {
 				if idx >= 1 {
-					tempIDsFile.WriteString("\n")
+					temp.WriteString("\n")
 				}
-				tempIDsFile.WriteString(element)
-
+				temp.WriteString(element)
 			}
-			tempIDsFile.Close()
-		}
-
-		if _, err := os.Stat(fileWithIds); err == nil {
-			processList(maxConc, fileWithIds, tempFile)
+			downloadIDs := temp.String()
+			gzipBuffer.Reset()
+			processList(maxConc, "", &downloadIDs, &gzipBuffer)
 		} else {
-			processSingleID(fileWithIds, &count)
+			if _, err := os.Stat(fileWithIds); err == nil {
+				processList(maxConc, fileWithIds, nil, nil)
+			} else {
+				processSingleID(fileWithIds, &count)
+			}
 		}
 
 		if isRemoteRun {
-			batchFileStats, _ := os.Stat(tempFile)
+
 			// get the size
-			size := batchFileStats.Size()
+			size := gzipBuffer.Len
 
 			extraParams := map[string]string{
 				"batchID":    batchID,
 				"batchUUID":  batchUUID,
 				"videoCount": strconv.FormatInt(combinedOutFile.recID, 10),
+				"workerUUID": cmdFlags.WorkerUUID,
+				"version":    strconv.FormatInt(int64(formatVersion), 10),
 			}
 			try := 0
-			maxTries := 40
+			maxTries := 250
 			allDone := false
 			//NewPostFile("http://localhost:8080/upload", extraParams, "file", "D:\\new_tv\\Outlander.S04E13.720p.WEB.H264-METCON[eztv].mkv")
 			for allDone == false && try < maxTries {
 				try++
 				fmt.Printf("Uploading block %s (%s) with %d records, %d bytes, attempt %d\n", batchID, batchUUID, combinedOutFile.recID, size, try)
 
-				response, err := sendMultipart(cmdFlags.MasterServer+"/submitBatchWorkUnit", extraParams, "data", tempFile)
+				response, err := sendMultipart(cmdFlags.MasterServer+"/submitBatchWorkUnit", extraParams, "data", &gzipBuffer)
 				if err == nil && response.StatusCode == 200 {
 					fmt.Printf("Block %s uploaded\n", batchID)
 					allDone = true
@@ -1653,6 +1736,9 @@ func argumentParsing(args []string) {
 					}
 					fmt.Printf("Block %s upload failed, try %d, will retry after sleep\n", batchID, try)
 					sleepTime := 5 * try
+					if sleepTime > 300 {
+						sleepTime = 300
+					}
 					fmt.Printf("Sleeping %d seconds\n", sleepTime)
 					time.Sleep(time.Duration(sleepTime) * time.Second)
 				}
@@ -1686,7 +1772,7 @@ func JSONMarshalIndentNoEscapeHTML(i interface{}, prefix string, indent string) 
 
 func main() {
 
-	runtime.GOMAXPROCS(256)
+	runtime.GOMAXPROCS(164)
 	rand.Seed(time.Now().Unix())
 
 	argumentParsing(os.Args[1:])
