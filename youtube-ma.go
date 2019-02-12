@@ -1619,14 +1619,15 @@ func populateFlags(args []string) {
 
 var controlClient = &http.Client{Timeout: 300 * time.Second}
 
-func getJSON(url string, target interface{}) error {
+func getJSON(url string, target interface{}) (int, error) {
 	r, err := controlClient.Get(url)
+
 	if err != nil {
-		return err
+		return 500, err
 	}
 	defer r.Body.Close()
 
-	return json.NewDecoder(r.Body).Decode(target)
+	return r.StatusCode, json.NewDecoder(r.Body).Decode(target)
 }
 
 func argumentParsing(args []string) {
@@ -1667,12 +1668,12 @@ func argumentParsing(args []string) {
 			newWorkBatch := new(workBatch) // or &Foo{}
 			batchUnitURL := cmdFlags.MasterServer + "/getBatchWorkUnit?version=" + strconv.FormatInt(int64(formatVersion), 10) + "&workerUUID=" + url.QueryEscape(cmdFlags.WorkerUUID)
 			//fmt.Println(batchUnitURL)
-			err := getJSON(batchUnitURL, newWorkBatch)
+			statusCode, err := getJSON(batchUnitURL, newWorkBatch)
 			if err != nil || (len(newWorkBatch.VideoIDS) == 0) {
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Unable to fetch getBatchWorkUnit: %v\n", err)
 				} else {
-					fmt.Fprintf(os.Stderr, "Recieved empty work unit, maybe all batches were downloaded\n")
+					fmt.Fprintf(os.Stderr, "Recieved empty work unit, status %d message %s \n", statusCode, newWorkBatch.Message)
 				}
 				sleepTime := 20
 				fmt.Printf("Sleeping %d seconds and then will retry\n", sleepTime)
